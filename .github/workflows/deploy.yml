@@ -49,8 +49,9 @@ jobs:
           key: ${{ secrets.KEY_TEST }}
           port: 22
           script: |
-            docker stop products-api || true
-            docker rm --force products-api || true
+            docker stop products-api transactions-api || true
+            docker rm --force products-api transactions-api || true
+            docker ps -q --filter publish=8080 | xargs -r docker stop
             docker pull ${{ secrets.DOCKER_USER }}/products-api:${{ github.sha }}
             docker run -d -p 8080:5000 \
               -e MONGO_URL='${{ secrets.MONGO_URL }}' \
