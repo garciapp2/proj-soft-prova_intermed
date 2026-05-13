@@ -1,92 +1,113 @@
-from flask import Flask, request, jsonify
-from pymongo import MongoClient
-from datetime import datetime
-import uuid
-import requests
 import os
-MONGO_URL = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
-USER_API_URL = os.environ.get('USER_API_URL', 'http://18.228.48.67')
+import uuid
+from datetime import datetime, timezone
+from enum import StrEnum
+
+import jwt
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from jwt import PyJWKClient
+from pymongo import MongoClient
+
+MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+DOMAIN = os.environ.get("AUTH0_DOMAIN", "")
+AUDIENCE = os.environ.get("AUTH0_AUDIENCE", "")
+ROLES_CLAIM = os.environ.get("AUTH0_ROLES_CLAIM") or "https://proj-soft/roles"
+
+
+class Status(StrEnum):
+    DISPONIVEL = "DISPONIVEL"
+    INDISPONIVEL = "INDISPONIVEL"
 
 
 app = Flask(__name__)
-client = MongoClient(MONGO_URL)
-db = client['transacoes_db']
-transacoes_collection = db['transacoes']
+CORS(app)
+products = MongoClient(MONGO_URL)["ecommerce_db"]["products"]
 
-@app.route("/transacao", methods=["GET"])
-def get_transacoes():
-    id_cliente = request.args.get('id_cliente')
-    query = {}
-    if id_cliente:
-        query = {"id_cliente": id_cliente}
-        
-    transacoes = list(transacoes_collection.find(query, {"_id": 0}))
-    if not transacoes:
-        return jsonify({"mensagem": "Nenhuma transação encontrada."}), 404
-        
-    return jsonify(transacoes), 200
 
-@app.route("/transacao/<string:id>", methods=["DELETE"])
-def delete_transacao(id):
-    result = transacoes_collection.delete_one({"id": id})
-
-    if result.deleted_count == 0:
-        return jsonify({"mensagem": "Transação não encontrada."}), 404
-        
-    return jsonify({"mensagem": "Transação deletada com sucesso."}), 200
-
-@app.route("/transacao", methods=["POST"])
-def create_transacao():
-    data = request.get_json()
-    if not data:
-        return jsonify({"mensagem": "Corpo da requisição inválido. Forneça um JSON."}), 400
-
-    required_fields = ["id_cliente", "codigo_acao", "quantidade", "preco_unitario"]
-    for field in required_fields:
-        if field not in data or not data[field]:
-            return jsonify({"mensagem": f"Campo '{field}' é obrigatório."}), 400
-
-    id_cliente = data["id_cliente"]
-    codigo_acao = data["codigo_acao"]
-    quantidade = data["quantidade"]
-    preco_unitario = data["preco_unitario"]
-
+def jwt_payload():
+    auth = request.headers.get("Authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None, (jsonify({"mensagem": "Sem token."}), 401)
+    tok = auth.split(None, 1)[1].strip()
+    if not DOMAIN or not AUDIENCE:
+        return None, (jsonify({"mensagem": "Falta AUTH0_DOMAIN / AUTH0_AUDIENCE."}), 500)
     try:
-        user_response = requests.get(f"{USER_API_URL}/users/{id_cliente}")
-        user_response.raise_for_status()
-        user_data = user_response.json()
-        user_email = user_data.get("email")
-        if not user_email:
-            return jsonify({"mensagem": "E-mail do usuário não encontrado na API de usuários."}), 500
-    except requests.exceptions.RequestException as e:
-        if e.response and e.response.status_code == 404:
-            return jsonify({"mensagem": f"Cliente com id '{id_cliente}' não encontrado."}), 404
-        else:
-            return jsonify({"mensagem": f"Erro ao comunicar com a API de usuários: {str(e)}"}), 500
+        key = PyJWKClient(f"https://{DOMAIN}/.well-known/jwks.json").get_signing_key_from_jwt(tok).key
+        return jwt.decode(tok, key, algorithms=["RS256"], audience=AUDIENCE, issuer=f"https://{DOMAIN}/"), None
+    except jwt.ExpiredSignatureError:
+        return None, (jsonify({"mensagem": "Token expirado."}), 401)
+    except jwt.InvalidTokenError as e:
+        return None, (jsonify({"mensagem": str(e)}), 401)
 
+
+def roles(p):
+    for k in (ROLES_CLAIM, "roles", "permissions"):
+        v = p.get(k) if k else None
+        if isinstance(v, list):
+            return [str(x).upper() for x in v]
+        if isinstance(v, str) and v:
+            return [v.upper()]
+    return []
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.get("/products")
+def listar():
+    p, err = jwt_payload()
+    if err:
+        return err
+    if not (set(roles(p)) & {"ADMIN", "USER"}):
+        return jsonify({"mensagem": "Sem papel USER/ADMIN."}), 403
+    return jsonify(list(products.find({}, {"_id": 0})))
+
+
+@app.post("/products")
+def criar():
+    p, err = jwt_payload()
+    if err:
+        return err
+    if "ADMIN" not in roles(p):
+        return jsonify({"mensagem": "Só ADMIN."}), 403
+    d = request.get_json(silent=True) or {}
+    if not d.get("codigo") or not d.get("nome") or d.get("preco") is None:
+        return jsonify({"mensagem": "codigo, nome, preco obrigatórios."}), 400
     try:
-        valor_total = quantidade * preco_unitario
-    except TypeError:
-        return jsonify({"mensagem": "Campos 'quantidade' e 'preco_unitario' devem ser números válidos."}), 400
-
-    nova_transacao = {
+        st = Status(d.get("status", "DISPONIVEL"))
+    except ValueError:
+        return jsonify({"mensagem": "status: DISPONIVEL ou INDISPONIVEL"}), 400
+    try:
+        preco = float(d["preco"])
+    except (TypeError, ValueError):
+        return jsonify({"mensagem": "preco inválido"}), 400
+    doc = {
         "id": str(uuid.uuid4()),
-        "id_cliente": id_cliente,
-        "nome_cliente": user_data.get("name"),
-        "email_cliente": user_email,
-        "codigo_acao": codigo_acao,
-        "quantidade": quantidade,
-        "preco_unitario": preco_unitario,
-        "valor_total": valor_total,
-        "data_transacao": datetime.now().isoformat()
+        "codigo": str(d["codigo"]),
+        "nome": str(d["nome"]),
+        "preco": preco,
+        "data_cadastro": datetime.now(timezone.utc).isoformat(),
+        "status": st.value,
+        "email_admin": p.get("email") or p.get("sub") or "?",
     }
-    try:
-        transacoes_collection.insert_one(nova_transacao)
-        nova_transacao.pop("_id", None) 
-        return jsonify(nova_transacao), 201
-    except Exception as e:
-        return jsonify({"mensagem": f"Erro ao salvar a transação no banco de dados: {str(e)}"}), 500
+    products.insert_one(doc)
+    return jsonify(doc), 201
+
+
+@app.delete("/products/<pid>")
+def apagar(pid):
+    p, err = jwt_payload()
+    if err:
+        return err
+    if "ADMIN" not in roles(p):
+        return jsonify({"mensagem": "Só ADMIN."}), 403
+    if products.delete_one({"id": pid}).deleted_count == 0:
+        return jsonify({"mensagem": "Não achei."}), 404
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=500)
+    app.run(debug=True, port=5000)

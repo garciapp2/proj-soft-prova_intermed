@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>Produtos</title>
+  <script src="https://cdn.auth0.com/js/auth0-spa-js/2.1/auth0-spa-js.production.js"></script>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 1rem auto; padding: 0 8px; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { border: 1px solid #ccc; padding: 4px; }
+    label { display: block; margin: 6px 0; }
+    #er { color: #c00; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+  <h1>Produtos</h1>
+  <p id="who"></p>
+  <button id="in">Entrar</button> <button id="out">Sair</button>
+  <p id="er"></p>
+  <div id="adm" hidden>
+    <h3>Novo</h3>
+    <form id="f">
+      <label>Código <input name="codigo" required /></label>
+      <label>Nome <input name="nome" required /></label>
+      <label>Preço <input name="preco" type="number" step="0.01" required /></label>
+      <label>Status <select name="status"><option>DISPONIVEL</option><option>INDISPONIVEL</option></select></label>
+      <button>Cadastrar</button>
+    </form>
+  </div>
+  <h3>Lista</h3>
+  <button id="at">Atualizar</button>
+  <div id="lista"></div>
+
+<script>
+const AUTH0_DOMAIN = "dev-mabrcqadb5lknp4l.us.auth0.com";
+const AUTH0_CLIENT_ID = "DNAj795rEYtwZjCTSiRiHfLJdMgwJJhT";
+const AUTH0_AUDIENCE = "https://api-produtos/";
+const AUTH0_ROLES_CLAIM = "https://proj-soft/roles";
+const API_BASE_URL = "http://localhost:5000";
+
+const $ = (id) => document.getElementById(id);
+const api = () => API_BASE_URL.replace(/\/$/, "");
+const fail = (r) => { $("er").textContent = r.status || ""; };
+
+function roles(tok) {
+  try {
+    const p = JSON.parse(atob(tok.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    const r = p[AUTH0_ROLES_CLAIM] || p.roles || p.permissions || [];
+    return (Array.isArray(r) ? r : [r]).map((x) => String(x).toUpperCase());
+  } catch { return []; }
+}
+
+let client;
+const token = () => client.getTokenSilently({ authorizationParams: { audience: AUTH0_AUDIENCE } });
+
+(async () => {
+  if (!AUTH0_DOMAIN || !AUTH0_CLIENT_ID || !AUTH0_AUDIENCE) return;
+  client = await auth0.createAuth0Client({
+    domain: AUTH0_DOMAIN,
+    clientId: AUTH0_CLIENT_ID,
+    authorizationParams: { redirect_uri: location.origin, audience: AUTH0_AUDIENCE, scope: "openid profile email" },
+    cacheLocation: "localstorage",
+  });
+  if (location.search.includes("code=") && location.search.includes("state=")) {
+    await client.handleRedirectCallback();
+    history.replaceState({}, "", location.pathname);
+  }
+  const ok = await client.isAuthenticated();
+  $("in").onclick = () => client.loginWithRedirect();
+  $("out").onclick = () => client.logout({ logoutParams: { returnTo: location.origin } });
+  $("in").hidden = ok;
+  $("out").hidden = !ok;
+  if (!ok) return;
+
+  const u = await client.getUser();
+  const t0 = await token();
+  const rs = roles(t0);
+  $("who").textContent = u.email || "";
+  $("adm").hidden = !rs.includes("ADMIN");
+
+  async function load() {
+    $("er").textContent = "";
+    const r = await fetch(api() + "/products", { headers: { Authorization: "Bearer " + await token() } });
+    if (!r.ok) { fail(r); $("lista").textContent = ""; return; }
+    const data = await r.json();
+    if (!data.length) { $("lista").textContent = "—"; return; }
+    const adm = roles(await token()).includes("ADMIN");
+    let h = "<table><tr><th>Cód</th><th>Nome</th><th>Preço</th><th>Status</th>" + (adm ? "<th></th>" : "") + "</tr>";
+    for (const p of data) {
+      h += "<tr><td>" + p.codigo + "</td><td>" + p.nome + "</td><td>" + p.preco + "</td><td>" + p.status + "</td>";
+      if (adm) h += '<td><button data-id="' + p.id + '">X</button></td>';
+      h += "</tr>";
+    }
+    $("lista").innerHTML = h + "</table>";
+    $("lista").querySelectorAll("button[data-id]").forEach((b) => {
+      b.onclick = async () => {
+        const rr = await fetch(api() + "/products/" + b.dataset.id, {
+          method: "DELETE",
+          headers: { Authorization: "Bearer " + await token() },
+        });
+        if (!rr.ok) fail(rr);
+        else load();
+      };
+    });
+  }
+
+  $("at").onclick = load;
+  $("f").onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const r = await fetch(api() + "/products", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + await token(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        codigo: fd.get("codigo"),
+        nome: fd.get("nome"),
+        preco: +fd.get("preco"),
+        status: fd.get("status"),
+      }),
+    });
+    if (!r.ok) fail(r);
+    else { e.target.reset(); load(); }
+  };
+  load();
+})();
+</script>
+</body>
+</html>
